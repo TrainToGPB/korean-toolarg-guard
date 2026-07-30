@@ -34,12 +34,12 @@ decoded characters. Escaped and raw are **indistinguishable** there.
 So the obvious ideas do not work, and it is worth saying why so nobody rebuilds them:
 
 - **A "no unicode escapes in arguments" hook cannot work.** Hooks sit below the decode;
-  there is nothing left to inspect.
+there is nothing left to inspect.
 - **Round-tripping proves nothing.** Fetching the stored content back and comparing it to
-  context always agrees, because the intended original was never present in a verifiable
-  form. That checks transport and storage, not spelling.
+context always agrees, because the intended original was never present in a verifiable
+form. That checks transport and storage, not spelling.
 - **Instructing "write raw UTF-8" is unverifiable.** Neither the model nor a hook can
-  confirm compliance after the fact.
+confirm compliance after the fact.
 
 The network is the one vantage point upstream of the parse.
 
@@ -47,10 +47,12 @@ The network is the one vantage point upstream of the parse.
 
 Two pieces, because neither can do the job alone:
 
-| | sees the escapes | can stop the call |
-|---|---|---|
-| `proxy/tee_proxy.py` | **yes** — reads the raw wire format | no |
-| `hooks/escape_guard.py` | no — `tool_input` arrives decoded | **yes** — `PreToolUse` deny |
+
+|                         | sees the escapes                    | can stop the call           |
+| ----------------------- | ----------------------------------- | --------------------------- |
+| `proxy/tee_proxy.py`    | **yes** — reads the raw wire format | no                          |
+| `hooks/escape_guard.py` | no — `tool_input` arrives decoded   | **yes** — `PreToolUse` deny |
+
 
 They are joined by `tool_use_id`. In a streaming response, tool arguments arrive as
 `content_block_delta` events carrying `delta.input_json_delta.partial_json`. That field is
@@ -73,6 +75,9 @@ beats the CLI to `PreToolUse` — no race.
 `hooks/session_note.py` additionally states the failure mode once per session, on the first
 prompt, so the habit is present even with no proxy running.
 
+`hooks/ensure_proxy.py` runs at `SessionStart` and brings the proxy up when you have opted
+in, so the only manual step is the one-time settings edit below.
+
 ## Install
 
 ```shell
@@ -88,34 +93,61 @@ running the flag directory stays empty and `escape_guard` exits immediately on e
 
 ### Turning on detection
 
-```bash
-python3 proxy/selftest.py          # offline check, no API budget
+Detection needs the proxy in the path, which is one edit you make once — a plugin cannot do
+it for you. `ANTHROPIC_BASE_URL` is resolved when the CLI starts, and a plugin's own
+`settings.json` may only set `agent` and `subagentStatusLine`, so it cannot inject
+environment variables. Add to your `~/.claude/settings.json`:
 
-python3 proxy/tee_proxy.py --upstream https://api.anthropic.com/v1 --port 8099 --verbose
+```json
+"env": {
+  "ANTHROPIC_BASE_URL":    "http://127.0.0.1:8099/v1",
+  "KOREAN_GUARD_UPSTREAM": "https://api.anthropic.com/v1"
+}
 ```
 
-Then point a **separate** shell at it — leave your real settings alone:
+`KOREAN_GUARD_UPSTREAM` is the real endpoint the proxy forwards to, and also the opt-in
+switch: **without it nothing starts.** Installing the plugin never launches a background
+process you did not ask for.
+
+With those two lines in place the `SessionStart` hook starts the proxy for you if it is not
+already listening, so you never launch it by hand. That ordering is verified — from a cold
+start, with nothing on the port, a session comes up and answers normally.
 
 ```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:8099/v1 claude
+python3 proxy/selftest.py    # offline check of the detector, no API budget
 ```
 
 No TLS interception is involved: the CLI speaks plain HTTP to localhost and the proxy opens
 its own TLS connection upstream, so no certificate has to be trusted. Authentication headers
 pass through untouched and are never logged.
 
-If an `env` block in your `settings.json` sets `ANTHROPIC_BASE_URL`, it wins over the shell
-variable. Pass a copy with `--settings` instead of editing the original.
+**Understand the failure mode before you wire this up.** Once `ANTHROPIC_BASE_URL` points at
+the proxy, a proxy that is not listening means no API access at all. The `SessionStart` hook
+makes that unlikely by reviving it every session, but for an always-on setup prefer a
+supervised service and leave the hook as the backstop:
+
+```
+macOS   a launchd agent with KeepAlive
+Linux   a systemd user unit with Restart=always
+```
+
+To back out, delete the two env lines. To keep the plugin but leave the proxy alone, set
+`KOREAN_GUARD_PROXY=off`.
 
 ## Configuration
 
-| Variable | Default | Effect |
-|---|---:|---|
-| `KOREAN_GUARD_FLAG_DIR` | `~/.claude/.state/escape-guard` | where the proxy drops findings |
-| `KOREAN_GUARD_ESCAPE_MIN` | `1` | escaped Hangul syllables needed to refuse |
-| `KOREAN_GUARD_MAX_DENY` | `2` | refusals per session before giving up and passing the call through with a warning |
-| `KOREAN_GUARD_DISABLE` | unset | `1` disables both hooks for the shell |
-| `KOREAN_GUARD_FORCE_FLAG` | unset | `1` flags every Korean call regardless of escaping — for testing the refusal path only |
+
+| Variable                  | Default                         | Effect                                                                                 |
+| ------------------------- | -------------------------------: | -------------------------------------------------------------------------------------- |
+| `KOREAN_GUARD_FLAG_DIR`   | `~/.claude/.state/escape-guard` | where the proxy drops findings                                                         |
+| `KOREAN_GUARD_ESCAPE_MIN` | `1`                             | escaped Hangul syllables needed to refuse                                              |
+| `KOREAN_GUARD_MAX_DENY`   | `2`                             | refusals per session before giving up and passing the call through with a warning      |
+| `KOREAN_GUARD_UPSTREAM`   | unset                           | real base URL the proxy forwards to; also the opt-in switch for auto-start              |
+| `KOREAN_GUARD_PORT`       | `8099`                          | port the proxy listens on                                                              |
+| `KOREAN_GUARD_PROXY`      | unset                           | `off` keeps the hooks but never starts the proxy                                        |
+| `KOREAN_GUARD_DISABLE`    | unset                           | `1` disables both hooks for the shell                                                  |
+| `KOREAN_GUARD_FORCE_FLAG` | unset                           | `1` flags every Korean call regardless of escaping — for testing the refusal path only |
+
 
 The denial cap matters: a retry arrives with a fresh `tool_use_id`, so without a per-session
 ceiling a model that deterministically re-escapes would loop.
@@ -125,6 +157,10 @@ ceiling a model that deterministically re-escapes would loop.
 **The detection is proven.** `proxy/selftest.py` covers eight cases including a server that
 escapes all non-ASCII on the wire, a stream split mid-escape, both malformed-escape shapes
 seen in the wild, and LaTeX (`\\underbrace`) not false-positiving.
+
+**Auto-start is proven from cold.** With `ANTHROPIC_BASE_URL` pointed at a port nothing
+was listening on, a session came up and answered normally: the `SessionStart` hook won the
+race against the first API request.
 
 **The refusal path is proven end to end.** With `KOREAN_GUARD_FORCE_FLAG=1`, a live session
 was refused twice, the model read the reason and re-emitted, and the third call passed at the
@@ -145,9 +181,9 @@ lexical knowledge, which is why the session note asks for a read rather than a d
 An open defect in Claude Code, not something a plugin can fix:
 
 - [anthropics/claude-code#79339](https://github.com/anthropics/claude-code/issues/79339) —
-  pinpoints the mechanism; labelled `has repro`
+pinpoints the mechanism; labelled `has repro`
 - [anthropics/claude-code#69522](https://github.com/anthropics/claude-code/issues/69522) —
-  the broader parse-failure reports, on Windows and macOS, in Korean and Traditional Chinese
+the broader parse-failure reports, on Windows and macOS, in Korean and Traditional Chinese
 
 Both cover the **loud** branch: the escape is malformed, JSON parsing fails, the call is
 rejected with a visible error. The silent branch — well-formed escapes with wrong digits —
@@ -173,8 +209,18 @@ Claude Code가 **도구 호출 인자**의 한글을 `\uXXXX` 유니코드 이�
 왕복 검증도 원리상 무효입니다. 유일한 관측점이 네트워크입니다.
 
 그래서 두 조각으로 나눕니다. **프록시**가 와이어에서 이스케이프를 세고 `tool_use_id`로 플래그를
-남기면, **`PreToolUse` 훅**이 그걸 읽어 호출을 거부하고 "raw text로 다시 쓰라"는 이유를 모델에게
+남기면, `**PreToolUse` 훅**이 그걸 읽어 호출을 거부하고 "raw text로 다시 쓰라"는 이유를 모델에게
 돌려줍니다. 거부는 도구 실행 **전에** 걸리므로 잘못된 내용이 외부에 남지 않습니다.
+
+**프록시는 `SessionStart` 훅이 자동으로 띄웁니다.** 다만 트래픽을 프록시로 보내는 것은 플러그인이
+할 수 없습니다 — `ANTHROPIC_BASE_URL`은 CLI 기동 시점에 확정되고 플러그인 `settings.json`은 env를
+설정할 수 없습니다. 그래서 `settings.json`의 `env`에 `ANTHROPIC_BASE_URL`(프록시)과
+`KOREAN_GUARD_UPSTREAM`(실제 엔드포인트) 두 줄만 한 번 넣으면 됩니다. `KOREAN_GUARD_UPSTREAM`이
+옵트인 스위치이기도 해서, 없으면 아무것도 켜지지 않습니다.
+
+**주의**: 그 두 줄을 넣은 뒤에는 프록시가 죽으면 API 접근이 아예 막힙니다. 훅이 매 세션 되살리지만,
+상시 운용은 launchd(`KeepAlive`)나 systemd(`Restart=always`)로 감독하고 훅은 보조로 두는 편이
+안전합니다. 되돌리려면 두 줄을 지우면 되고, 프록시만 끄려면 `KOREAN_GUARD_PROXY=off`입니다.
 
 프록시를 켜지 않으면 플러그인은 세션 첫 프롬프트에 주의사항만 넣고 나머지는 완전히 무해합니다.
 설정 파일의 `env`가 셸 환경변수를 덮으므로, 원본을 고치지 말고 사본을 `--settings`로 넘기십시오.
