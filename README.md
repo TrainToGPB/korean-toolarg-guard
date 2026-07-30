@@ -75,8 +75,11 @@ beats the CLI to `PreToolUse` — no race.
 `hooks/session_note.py` additionally states the failure mode once per session, on the first
 prompt, so the habit is present even with no proxy running.
 
-`hooks/ensure_proxy.py` runs at `SessionStart` and brings the proxy up when you have opted
-in, so the only manual step is the one-time settings edit below.
+`hooks/ensure_proxy.py` runs at `SessionStart` and brings the proxy up when you have opted in,
+for setups without a service manager. With the supervised service installed it finds the port
+already open and exits, so the two do not fight.
+
+`skills/setup/` drives the whole installation, including the verification and the rollback.
 
 ## Install
 
@@ -93,25 +96,32 @@ running the flag directory stays empty and `escape_guard` exits immediately on e
 
 ### Turning on detection
 
-Detection needs the proxy in the path, which is one edit you make once — a plugin cannot do
-it for you. `ANTHROPIC_BASE_URL` is resolved when the CLI starts, and a plugin's own
-`settings.json` may only set `agent` and `subagentStatusLine`, so it cannot inject
-environment variables. Add to your `~/.claude/settings.json`:
-
-```json
-"env": {
-  "ANTHROPIC_BASE_URL":    "http://127.0.0.1:8099/v1",
-  "KOREAN_GUARD_UPSTREAM": "https://api.anthropic.com/v1"
-}
+```
+/korean-toolarg-guard:setup
 ```
 
-`KOREAN_GUARD_UPSTREAM` is the real endpoint the proxy forwards to, and also the opt-in
-switch: **without it nothing starts.** Installing the plugin never launches a background
-process you did not ask for.
+The skill does the whole thing: reads your current endpoint, installs the proxy as a
+supervised service (launchd on macOS, a systemd user unit on Linux), **proves a request
+works through it before touching your live configuration**, then points
+`ANTHROPIC_BASE_URL` at it with a backup. `/korean-toolarg-guard:setup` again reports
+status, and it can undo everything.
 
-With those two lines in place the `SessionStart` hook starts the proxy for you if it is not
-already listening, so you never launch it by hand. That ordering is verified — from a cold
-start, with nothing on the port, a session comes up and answers normally.
+Why a supervised service rather than something the plugin starts by itself: a plugin cannot
+set `ANTHROPIC_BASE_URL` for its own session — the CLI resolves it at startup, and a plugin's
+`settings.json` may only set `agent` and `subagentStatusLine`. So the wiring is a one-time
+edit either way, and once you are making it, a service that restarts on failure is strictly
+better than one started per session.
+
+**Understand the failure mode.** Once the base URL points at the proxy, a proxy that is not
+listening means no API access — in every session on the machine. That is why setup verifies
+before wiring, keeps a backup, and why `KeepAlive` / `Restart=always` matter. To back out, run
+the skill again and choose uninstall.
+
+On a machine with no service manager, setup falls back to hook mode: the plugin's
+`SessionStart` hook starts the proxy at the beginning of each session. Weaker — it cannot
+revive a proxy that dies mid-session — but it needs nothing installed. Opting in is a single
+env var, `KOREAN_GUARD_UPSTREAM`; without it the hook exits silently, so installing the plugin
+never leaves a background process nobody asked for.
 
 ```bash
 python3 proxy/selftest.py    # offline check of the detector, no API budget
@@ -120,19 +130,6 @@ python3 proxy/selftest.py    # offline check of the detector, no API budget
 No TLS interception is involved: the CLI speaks plain HTTP to localhost and the proxy opens
 its own TLS connection upstream, so no certificate has to be trusted. Authentication headers
 pass through untouched and are never logged.
-
-**Understand the failure mode before you wire this up.** Once `ANTHROPIC_BASE_URL` points at
-the proxy, a proxy that is not listening means no API access at all. The `SessionStart` hook
-makes that unlikely by reviving it every session, but for an always-on setup prefer a
-supervised service and leave the hook as the backstop:
-
-```
-macOS   a launchd agent with KeepAlive
-Linux   a systemd user unit with Restart=always
-```
-
-To back out, delete the two env lines. To keep the plugin but leave the proxy alone, set
-`KOREAN_GUARD_PROXY=off`.
 
 ## Configuration
 
@@ -157,6 +154,11 @@ ceiling a model that deterministically re-escapes would loop.
 **The detection is proven.** `proxy/selftest.py` covers eight cases including a server that
 escapes all non-ASCII on the wire, a stream split mid-escape, both malformed-escape shapes
 seen in the wild, and LaTeX (`\\underbrace`) not false-positiving.
+
+**Setup is reversible, and that is tested.** Wiring and unwiring round-trip exactly in both
+cases that matter: an existing company gateway is captured as the upstream and restored on
+uninstall, and a machine that never had `ANTHROPIC_BASE_URL` set gets the key removed rather
+than guessed at.
 
 **Auto-start is proven from cold.** With `ANTHROPIC_BASE_URL` pointed at a port nothing
 was listening on, a session came up and answered normally: the `SessionStart` hook won the
