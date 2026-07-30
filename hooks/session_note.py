@@ -16,11 +16,11 @@ import time
 
 CAP = 9000                      # documented hook output limit is 10,000 chars
 MARKER_TTL = 14 * 24 * 3600
-PAYLOAD_REL = os.path.join("reference", "hangul-toolarg-corruption.md")
+PAYLOAD_REL = os.path.join("reference", "escape-encoded-korean.md")
 
 HEADER = (
-    "`korean-toolarg-guard` 플러그인이 세션 첫 프롬프트에 주입하는 내용이다. "
-    "이 세션에서 한글을 도구 호출 인자에 넣을 때 적용되는, 실측으로 확인된 사실:\n\n"
+    "Injected by the korean-toolarg-guard plugin on the first prompt of this session. "
+    "Measured facts that apply whenever Korean goes into a tool-call argument:\n\n"
 )
 
 

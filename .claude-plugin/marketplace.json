@@ -8,7 +8,7 @@
     {
       "name": "korean-toolarg-guard",
       "source": ".",
-      "description": "Korean text in tool-call arguments can be silently corrupted into different-but-valid Hangul syllables. States the failure mode once per session and flags Korean-heavy MCP writes for re-reading."
+      "description": "Detects Korean written as \\uXXXX escapes in tool-call arguments and refuses the call, telling the model to re-emit raw text."
     }
   ]
 }

@@ -13,11 +13,11 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "mcp__.*",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/verify_nudge.py\" --state \"${CLAUDE_PLUGIN_DATA}\"",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/escape_guard.py\"",
             "timeout": 10
           }
         ]

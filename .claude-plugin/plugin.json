@@ -1,17 +1,19 @@
 {
   "name": "korean-toolarg-guard",
   "displayName": "Korean Tool-Arg Guard",
-  "version": "0.1.0",
-  "description": "Korean text placed in tool-call arguments can be silently corrupted into different-but-valid Hangul syllables. This plugin states the failure mode once per session and reminds you to re-read Korean sent to external destinations.",
+  "version": "0.2.0",
+  "description": "Claude Code sometimes spells Korean in tool-call arguments as \\uXXXX escapes, which inflates tokens and turns one wrong hex digit into a different-but-valid Hangul syllable. A wire-level proxy detects the escapes and a PreToolUse hook refuses the call before it runs.",
   "author": {
     "name": "TrainToGPB"
   },
   "keywords": [
     "korean",
     "hangul",
+    "cjk",
     "i18n",
     "unicode",
     "tool-arguments",
+    "proxy",
     "quality"
   ],
   "license": "MIT"
