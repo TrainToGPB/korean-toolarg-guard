@@ -57,6 +57,26 @@ Two consequences:
 Generation is what degrades; recognition is fine. That asymmetry is the basis for this
 plugin's approach: it does not try to prevent the corruption, it makes sure someone looks.
 
+### Upstream issues
+
+This is a known, open defect in Claude Code, not something a plugin can fix:
+
+- [anthropics/claude-code#79339](https://github.com/anthropics/claude-code/issues/79339) —
+  pinpoints the mechanism: the model glitches mid-escape and emits a backslash followed by
+  a raw CJK character, making the whole input unparsable. Labelled `has repro`.
+- [anthropics/claude-code#69522](https://github.com/anthropics/claude-code/issues/69522) —
+  the broader report: long unicode-escaped tool arguments failing JSON parse. Corroborated
+  on both Windows and macOS, and in Traditional Chinese as well as Korean.
+
+Both were **open** as of July 2026, on `claude-opus-4-8` and `claude-opus-5` alike.
+
+Note the difference in consequence. Those reports cover the **loud** branch: the escape is
+invalid, JSON parsing fails, and the call is rejected with an error you can see and retry.
+This plugin exists for the **silent** branch: the escape is well-formed but the hex digits
+are wrong, so the JSON parses, the call succeeds, and the corrupted text simply lands. Same
+cause, no error — which is why it needs a reading habit rather than an error handler.
+Evidence and measurements: [this comment](https://github.com/anthropics/claude-code/issues/79339#issuecomment-5125788936).
+
 ## What this plugin does
 
 **1. `UserPromptSubmit` — session note (once per session).** Injects
@@ -134,6 +154,12 @@ U+AC00–D7A3 구간이 촘촘해서 다른 적법한 음절로 착지합니다.
 하니스가 파싱할 때 문자로 디코딩되어 트랜스크립트·모델 컨텍스트·훅의 `tool_input`에는 결과
 문자만 돌아옵니다. 그래서 raw UTF-8로 쓰라는 지시는 방향은 맞아도 준수 검증이 불가능하고,
 "인자에 유니코드 금지" 같은 구문 검사도 실효가 없습니다(훅은 디코드 하류).
+두 실패 양상은 업스트림에 이미 보고돼 있고 **2026-07 기준 미해결**입니다 —
+[#79339](https://github.com/anthropics/claude-code/issues/79339)(메커니즘 특정, `has repro`),
+[#69522](https://github.com/anthropics/claude-code/issues/69522)(파싱 실패 전반). 다만 두 이슈는
+이스케이프가 **무효**여서 호출이 거부되는 loud 분기이고, 이 플러그인이 다루는 것은 이스케이프가
+**유효한데 16진수만 틀려** 조용히 통과하는 silent 분기입니다. 근거: [코멘트](https://github.com/anthropics/claude-code/issues/79339#issuecomment-5125788936).
+
 
 **생성은 손상되지만 인식은 정상입니다.** 이 플러그인은 예방이 아니라 검출을 돕습니다.
 
