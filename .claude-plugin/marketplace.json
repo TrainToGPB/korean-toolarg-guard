@@ -1,0 +1,14 @@
+{
+  "name": "hangul-tools",
+  "description": "Tooling for people who work in Korean with Claude Code, starting with guards against silent Hangul corruption in tool-call arguments.",
+  "owner": {
+    "name": "TrainToGPB"
+  },
+  "plugins": [
+    {
+      "name": "korean-toolarg-guard",
+      "source": ".",
+      "description": "Korean text in tool-call arguments can be silently corrupted into different-but-valid Hangul syllables. States the failure mode once per session and flags Korean-heavy MCP writes for re-reading."
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "name": "korean-toolarg-guard",
+  "displayName": "Korean Tool-Arg Guard",
+  "version": "0.1.0",
+  "description": "Korean text placed in tool-call arguments can be silently corrupted into different-but-valid Hangul syllables. This plugin states the failure mode once per session and reminds you to re-read Korean sent to external destinations.",
+  "author": {
+    "name": "TrainToGPB"
+  },
+  "keywords": [
+    "korean",
+    "hangul",
+    "i18n",
+    "unicode",
+    "tool-arguments",
+    "quality"
+  ],
+  "license": "MIT"
+}
