@@ -67,6 +67,9 @@ def main():
     ap.add_argument("--state", default="")
     args, _ = ap.parse_known_args()
 
+    if os.environ.get("KOREAN_GUARD_DISABLE") == "1":
+        sys.exit(0)                       # off-switch: benchmarking, or opt-out per shell
+
     threshold = env_int("KOREAN_GUARD_MIN_HANGUL", 150)
     max_nudges = env_int("KOREAN_GUARD_MAX_NUDGES", 6)
     if max_nudges == 0:

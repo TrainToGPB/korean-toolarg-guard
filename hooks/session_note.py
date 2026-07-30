@@ -54,6 +54,9 @@ def strip_frontmatter(text):
 
 
 def main():
+    if os.environ.get("KOREAN_GUARD_DISABLE") == "1":
+        sys.exit(0)                       # off-switch: benchmarking, or opt-out per shell
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="")
     ap.add_argument("--state", default="")

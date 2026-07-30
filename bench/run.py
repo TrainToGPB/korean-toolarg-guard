@@ -31,6 +31,7 @@ Usage
   ./run.py --selftest          # validates the scorer, spends no API budget
 """
 import argparse
+import concurrent.futures
 import difflib
 import json
 import os
@@ -40,6 +41,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import unicodedata
 
 HANGUL = re.compile(r"[가-힣]")
@@ -53,6 +55,35 @@ PROMPT = (
     "블록 표시(<원문>, </원문>)는 파일에 넣지 않는다.\n\n"
     "<원문>\n{body}\n</원문>\n"
 )
+
+
+# ── how the arms are separated ───────────────────────────────────────────────
+# Isolating by CLAUDE_CONFIG_DIR does not work: credentials live in the macOS
+# keychain, not in the config directory, so a cloned config reports "Not logged
+# in" no matter what is copied across. Arms are therefore separated in the real
+# environment by an env switch on the guard itself:
+#
+#   baseline : KOREAN_GUARD_DISABLE=1        -> the session note never fires
+#   plugin   : CLAUDE_KOREAN_GUARD_FILE=...  -> the note fires with the plugin's
+#                                               own payload
+#
+# Known confound, disclosed rather than hidden: if the operator has the condensed
+# pointer in their user-level CLAUDE.md, both arms see it, so the plugin arm is
+# measured as a *marginal* effect over that pointer, not against a blank slate.
+# The pooled corruption rate across both arms is unaffected by this and is the
+# more robust number of the two.
+PAYLOAD = os.path.join(PLUGIN_ROOT, "reference", "hangul-toolarg-corruption.md")
+
+
+def arm_env(arm):
+    env = dict(os.environ)
+    env.pop("KOREAN_GUARD_DISABLE", None)
+    env.pop("CLAUDE_KOREAN_GUARD_FILE", None)
+    if arm == "baseline":
+        env["KOREAN_GUARD_DISABLE"] = "1"
+    else:
+        env["CLAUDE_KOREAN_GUARD_FILE"] = PAYLOAD
+    return env
 
 
 # ── scoring ──────────────────────────────────────────────────────────────────
@@ -91,21 +122,11 @@ def score(src, got):
 def run_trial(arm, passage_path, keep=False):
     src = open(passage_path, encoding="utf-8").read().strip()
     work = tempfile.mkdtemp(prefix=f"ktg-{arm}-")
-    cfg = os.path.join(work, "cfg")
-    os.makedirs(cfg, exist_ok=True)
-    # minimal, hook-free, MCP-free config so neither arm inherits the operator's setup
-    with open(os.path.join(cfg, "settings.json"), "w", encoding="utf-8") as f:
-        json.dump({"includeCoAuthoredBy": False}, f)
-
     target = os.path.join(work, "out.md")
     prompt = PROMPT.format(target=target, body=src)
 
     cmd = ["claude", "-p", prompt, "--permission-mode", "bypassPermissions"]
-    if arm == "plugin":
-        cmd += ["--plugin-dir", PLUGIN_ROOT]
-
-    env = dict(os.environ, CLAUDE_CONFIG_DIR=cfg)
-    env.pop("CLAUDE_KOREAN_GUARD_FILE", None)
+    env = arm_env(arm)
     rec = {"arm": arm, "passage": os.path.basename(passage_path), "workdir": work}
     try:
         p = subprocess.run(cmd, cwd=work, env=env, capture_output=True, text=True,
@@ -125,28 +146,43 @@ def run_trial(arm, passage_path, keep=False):
     else:
         rec["wrote_file"] = False
 
-    rec.update(inspect_transcript(cfg, target))
+    proj_dir, info = inspect_transcript(work, target)
+    rec.update(info)
     if not keep:
         shutil.rmtree(work, ignore_errors=True)
+        if proj_dir:                    # don't leave a transcript dir per trial behind
+            shutil.rmtree(proj_dir, ignore_errors=True)
         rec.pop("workdir", None)
     return rec
 
 
-def inspect_transcript(cfg, target):
-    """Did a Read of the target follow the Write? Also count guard injections."""
+def inspect_transcript(work, target):
+    """Did a Read of the target follow the Write? Also count guard injections.
+
+    Trials run in the real config dir, so locate this trial's transcript by the
+    unique temp cwd name that Claude Code slugifies into the project dir name.
+    """
     out = {"reread": False, "write_calls": 0, "guard_injected": 0, "nudges": 0}
-    proj = os.path.join(cfg, "projects")
-    if not os.path.isdir(proj):
-        return out
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR") or \
+        os.path.join(os.path.expanduser("~"), ".claude")
+    proj_root = os.path.join(cfg, "projects")
+    tag = os.path.basename(work)
+    if not os.path.isdir(proj_root):
+        return None, out
+    hits = [os.path.join(proj_root, d) for d in os.listdir(proj_root) if tag in d]
+    if not hits:
+        return None, out
+    proj = hits[0]
     files = [os.path.join(dp, fn) for dp, _, fns in os.walk(proj)
              for fn in fns if fn.endswith(".jsonl")]
     saw_write = False
     for path in files:
         for raw in open(path, encoding="utf-8", errors="replace"):
-            if "korean-toolarg-guard" in raw:
+            # Marker taken from the payload text itself. Matching the script name
+            # would false-positive on the hook command line, which the transcript
+            # records on every trial whether the note fired or not.
+            if "모든 도구 호출 인자" in raw:
                 out["guard_injected"] += 1
-            if "되읽어" in raw and "korean-toolarg-guard" in raw:
-                out["nudges"] += 1
             try:
                 rec = json.loads(raw)
             except Exception:
@@ -163,7 +199,7 @@ def inspect_transcript(cfg, target):
                     saw_write = True
                 if name == "Read" and inp.get("file_path") == target and saw_write:
                     out["reread"] = True
-    return out
+    return proj, out
 
 
 # ── reporting ────────────────────────────────────────────────────────────────
@@ -229,6 +265,7 @@ def selftest():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--trials", type=int, default=4, help="trials per arm per passage")
+    ap.add_argument("--jobs", type=int, default=6, help="trials to run concurrently")
     ap.add_argument("--arms", default="baseline,plugin")
     ap.add_argument("--passages", default="", help="comma-separated filenames; default all")
     ap.add_argument("--out", default=os.path.join(HERE, "results.jsonl"))
@@ -242,23 +279,32 @@ def main():
     names = [x for x in a.passages.split(",") if x] or \
         sorted(f for f in os.listdir(CORPUS) if f.endswith(".md"))
     arms = [x for x in a.arms.split(",") if x]
-    rows = []
-    total = len(arms) * len(names) * a.trials
-    i = 0
-    with open(a.out, "w", encoding="utf-8") as fh:
-        for arm in arms:
-            for name in names:
-                for _ in range(a.trials):
-                    i += 1
-                    print(f"[{i}/{total}] {arm} / {name} ...", flush=True)
-                    r = run_trial(arm, os.path.join(CORPUS, name), keep=a.keep)
-                    rows.append(r)
-                    fh.write(json.dumps(r, ensure_ascii=False) + "\n")
-                    fh.flush()
-                    print(f"          wrote={r.get('wrote_file')} "
-                          f"corrupt={r.get('corrupt_chars', '-')} "
-                          f"reread={r.get('reread')} guard={r.get('guard_injected')}",
-                          flush=True)
+    jobs = [(arm, os.path.join(CORPUS, name))
+            for arm in arms for name in names for _ in range(a.trials)]
+    total = len(jobs)
+    print(f"{total} trials, {a.jobs} at a time\n")
+
+    rows, done, lock = [], [0], threading.Lock()
+    fh = open(a.out, "w", encoding="utf-8")
+
+    def work(job):
+        arm, path = job
+        r = run_trial(arm, path, keep=a.keep)
+        with lock:
+            done[0] += 1
+            rows.append(r)
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+            fh.flush()
+            print(f"[{done[0]}/{total}] {arm:8s} {r['passage']:14s} "
+                  f"wrote={str(r.get('wrote_file')):5s} "
+                  f"corrupt={str(r.get('corrupt_chars', '-')):>3s} "
+                  f"reread={str(r.get('reread')):5s} "
+                  f"guard={r.get('guard_injected')}", flush=True)
+        return r
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as ex:
+        list(ex.map(work, jobs))
+    fh.close()
     summarize(rows)
     print(f"\nraw -> {a.out}")
     return 0
