@@ -45,15 +45,65 @@ SPECS = os.path.join(HERE, "authoring")
 PAYLOAD = os.path.join(PLUGIN_ROOT, "reference", "hangul-toolarg-corruption.md")
 HANGUL = re.compile(r"[가-힣]")
 
-PROMPT = (
+PROMPT_DOC = (
     "아래 주제로 한국어 기술 설명 문서를 작성해서 `submit_document` 도구로 제출해라.\n\n"
     "주제: {topic}\n\n"
     "조건:\n"
     "- 본문 합계 {min_chars}자 이상\n"
-    "- 섹션 3개 이상으로 나눈다\n"
+    "- 섹션 4개 이상으로 나눈다\n"
     "- 아래 용어를 각각 최소 {each}회, 표기를 바꾸지 않고 그대로 사용한다:\n"
     "{terms}\n"
 )
+
+PROMPT_ASK = (
+    "아래 상황에서 담당자에게 물어볼 결정 사항을 정리해 `ask_decision` 도구로 물어라.\n\n"
+    "상황: {topic}\n\n"
+    "조건:\n"
+    "- 질문 {n_questions}개\n"
+    "- 질문마다 선택지 {n_options}개, 각 선택지의 label과 description을 모두 채운다\n"
+    "- description은 한 문장 이상으로 충실히 쓴다\n"
+    "- 아래 용어를 각각 최소 {each}회, 표기를 바꾸지 않고 그대로 사용한다:\n"
+    "{terms}\n"
+)
+
+
+def build_prompt(spec):
+    terms = "\n".join("  - " + t for t in spec["terms"])
+    each = spec.get("each_at_least", 2)
+    if spec.get("tool") == "ask_decision":
+        return PROMPT_ASK.format(topic=spec["topic"], each=each, terms=terms,
+                                 n_questions=spec.get("n_questions", 4),
+                                 n_options=spec.get("n_options", 4))
+    return PROMPT_DOC.format(topic=spec["topic"], each=each, terms=terms,
+                             min_chars=spec.get("min_chars", 1200))
+
+
+def delivered_strings(spec, payload):
+    """Every Korean-carrying string that arrived, per tool shape."""
+    out = []
+    if not isinstance(payload, dict):
+        return out
+    if spec.get("tool") == "ask_decision":
+        for q in payload.get("questions") or []:
+            if not isinstance(q, dict):
+                continue
+            for k in ("question", "header"):
+                if isinstance(q.get(k), str):
+                    out.append(q[k])
+            for o in q.get("options") or []:
+                if isinstance(o, dict):
+                    for k in ("label", "description"):
+                        if isinstance(o.get(k), str):
+                            out.append(o[k])
+        return out
+    if isinstance(payload.get("title"), str):
+        out.append(payload["title"])
+    for s in payload.get("sections") or []:
+        if isinstance(s, dict):
+            for k in ("heading", "body"):
+                if isinstance(s.get(k), str):
+                    out.append(s[k])
+    return out
 
 
 def arm_env(arm, sink):
@@ -94,16 +144,7 @@ def ed1_variants(term, text):
 
 
 def score(spec, doc):
-    strings = []
-    if isinstance(doc, dict):
-        if isinstance(doc.get("title"), str):
-            strings.append(doc["title"])
-        for s in doc.get("sections") or []:
-            if isinstance(s, dict):
-                for k in ("heading", "body"):
-                    if isinstance(s.get(k), str):
-                        strings.append(s[k])
-    text = "\n".join(strings)
+    text = "\n".join(delivered_strings(spec, doc))
     need = spec.get("each_at_least", 2)
     per_term, miss, flags = {}, 0, []
     for t in spec["terms"]:
@@ -117,9 +158,13 @@ def score(spec, doc):
             # (단계는 -> "계는" against 계층). If a term arrived the required number of
             # times, a near-neighbour elsewhere is a different word, not corruption.
             flags += ed1_variants(t, text)
+    if spec.get("tool") == "ask_decision":
+        units = len(doc.get("questions") or []) if isinstance(doc, dict) else 0
+    else:
+        units = len(doc.get("sections") or []) if isinstance(doc, dict) else 0
     return {"authored_hangul": len(HANGUL.findall(text)),
             "authored_chars": len(text),
-            "sections": len(doc.get("sections") or []) if isinstance(doc, dict) else 0,
+            "sections": units,
             "term_counts": per_term,
             "term_required": len(spec["terms"]) * need,
             "term_miss": miss,
@@ -136,9 +181,7 @@ def run_trial(arm, spec, model, keep=False):
             "args": [os.path.join(HERE, "sink_server.py")],
             "env": {"KTG_SINK_FILE": sink}}}}, f)
 
-    prompt = PROMPT.format(topic=spec["topic"], min_chars=spec["min_chars"],
-                           each=spec.get("each_at_least", 2),
-                           terms="\n".join("  - " + t for t in spec["terms"]))
+    prompt = build_prompt(spec)
     cmd = ["claude", "-p", prompt, "--permission-mode", "bypassPermissions",
            "--mcp-config", mcp_cfg, "--strict-mcp-config"]
     if model:
@@ -156,6 +199,7 @@ def run_trial(arm, spec, model, keep=False):
         rec["final_text"] = ""
         rec["error"] = "timeout"
 
+    want = spec.get("tool", "submit_document")
     doc, fetched, submits = None, 0, 0
     if os.path.exists(sink):
         for line in open(sink, encoding="utf-8", errors="replace"):
@@ -163,7 +207,7 @@ def run_trial(arm, spec, model, keep=False):
                 r = json.loads(line)
             except Exception:
                 continue
-            if r.get("kind") == "submit_document":
+            if r.get("kind") == want:
                 doc = r["payload"]
                 submits += 1
             elif r.get("kind") == "fetch_document":

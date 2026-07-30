@@ -72,7 +72,51 @@ the same false-positive wall that makes an automated detector impractical in gen
 distinguishing `파라밌터` from `파라미터` needs Korean lexical knowledge, not string
 distance.
 
-## Why a clean A/B is hard: the baseline is contaminated
+## Measured result (48 trials, `claude-opus-5`, 179,738 authored Hangul)
+
+Run with `clean_ab.sh`, which removes the user-level `CLAUDE.md` pointer for the duration so
+the baseline is genuinely uninformed, and restores it on every exit path.
+
+### Verification behaviour: a large effect
+
+| task | baseline | plugin |
+|---|---|---|
+| `a5` long document (~5,000 Hangul) | 1/8 | 8/8 |
+| `a6` paper-summary document (~5,000 Hangul) | 1/8 | 8/8 |
+| **document writes combined** | **2/16 (12%)** | **16/16 (100%)** |
+| `a7` `ask_decision` (nested options, no document) | 0/8 | 0/8 |
+
+Fisher exact, two-tailed, on the combined document writes: **p = 5.1 × 10⁻⁷**.
+
+The `a7` row is a validity check, not a failure. `ask_decision` submits no document, so there
+is nothing for `fetch_document` to return — and the plugin arm correctly does not call it.
+The effect is targeted at writes that produced something re-readable, not blind tool-spam.
+
+The hook fired in 21/24 plugin trials and 0/24 baseline trials. The three plugin trials
+showing `guard=0` all still verified, so those are almost certainly transcript-location
+misses in the harness rather than hook failures.
+
+### Corruption: still zero, and that is the honest headline for H1
+
+0 confirmed corruptions in 179,738 authored Hangul, in both arms.
+
+- The two `term_miss` events were compliance, not corruption: `레이턴시` and `디코더` each
+  appeared once where the task asked for twice.
+- All four near-miss flags were `디코더 → 인코더`, the known false positive — two real words
+  one syllable apart, where the model simply used `인코더` more often.
+
+So the plugin's effect on **corruption** remains undemonstrated, because corruption did not
+reproduce even at 180k Hangul on a nested MCP argument. That sits awkwardly against the
+hand-verified real case (13 corruptions in ~6,000 Hangul of a Notion page body), and the gap
+is worth naming rather than glossing: these trials are single-turn with a tiny tool schema,
+whereas the real case came from a deep multi-turn session against Notion's much larger
+schema with markdown-rich content. Whatever raises the rate in practice is not reproduced
+here, so **no corruption base rate should be quoted from this harness.**
+
+What can be quoted: the plugin changes verification behaviour from 12% to 100% on
+external-write tasks, which is exactly the claim it makes.
+
+## Why a clean baseline needs the pointer removed
 
 Arms are separated by an env switch on the guard (`KOREAN_GUARD_DISABLE=1` vs
 `CLAUDE_KOREAN_GUARD_FILE=…`), because isolating by `CLAUDE_CONFIG_DIR` does not work —
@@ -98,10 +142,11 @@ the plugin arm's mechanism along with the contamination.
 | Is the corruption real? | Yes — hand-verified in real authored output (see the linked comment) |
 | Does a copy task reproduce it? | No. 0 in 92,256 Hangul |
 | Does short-form authoring over a nested MCP argument reproduce it? | Not so far |
-| Does the plugin reduce corruption? | **Not demonstrated.** No corruption observed in either arm, so there is nothing to reduce in these conditions |
-| Does the plugin increase verification? | **Not demonstrated.** Both arms verify at ceiling, and the baseline is contaminated by the user-level pointer |
+| Does long-form authoring (~5,000 Hangul) over a nested MCP argument reproduce it? | No. 0 in 179,738 Hangul |
+| Does the plugin reduce corruption? | **Not demonstrated** — corruption never reproduced, so there was nothing to reduce |
+| Does the plugin increase verification? | **Yes.** 12% → 100% on external-write tasks, p = 5.1 × 10⁻⁷ |
 
-What would move this forward, in rough order of value: much longer authored payloads (the
-one hand-verified real case was ~6,000 Hangul in a single body string, roughly 4× these
-trials); a genuinely clean baseline; and, for scoring free prose rather than seeded terms, a
-morphological analyser with a false-positive rate calibrated against known-clean Korean.
+What would move the corruption question forward: reproducing the conditions the real case had
+but these trials do not — a large real tool schema, a deep multi-turn session, markdown-rich
+content — and, for scoring free prose rather than seeded terms, a morphological analyser with
+a false-positive rate calibrated against known-clean Korean.

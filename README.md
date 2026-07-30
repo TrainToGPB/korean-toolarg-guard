@@ -92,6 +92,24 @@ session so it cannot become noise.
 Local `Write`/`Edit` are deliberately **not** nudged: you review those in diffs. The
 dangerous case is a long Korean body published to a service where nobody looks again.
 
+## Measured effect
+
+From [`bench/`](bench/) — 48 trials on `claude-opus-5`, 179,738 Hangul authored and delivered
+through a nested MCP argument, with the baseline arm genuinely uninformed:
+
+| | baseline | plugin |
+|---|---|---|
+| verified the write afterwards | **2/16 (12%)** | **16/16 (100%)** |
+
+Fisher exact, two-tailed: **p = 5.1 × 10⁻⁷**. On a control task that submits no document,
+both arms correctly decline to re-read — the effect is targeted, not blind tool-spam.
+
+**Corruption reduction is not demonstrated, and the benchmark says so.** Corruption did not
+reproduce even at 180k Hangul in these conditions, so there was nothing to reduce; the
+hand-verified real case came from a deep session against a much larger real tool schema. No
+corruption rate should be quoted from the harness. What is measured is the behaviour this
+plugin actually claims: that somebody looks.
+
 ## Install
 
 ```shell

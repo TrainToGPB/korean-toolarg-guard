@@ -49,6 +49,41 @@ TOOLS = [
         },
     },
     {
+        "name": "ask_decision",
+        "description": ("Ask the operator to choose between options before continuing. "
+                        "Mirrors the argument shape of a multiple-choice prompt: a list "
+                        "of questions, each carrying a list of labelled options."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {"type": "string"},
+                            "header": {"type": "string"},
+                            "multiSelect": {"type": "boolean"},
+                            "options": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {"type": "string"},
+                                        "description": {"type": "string"},
+                                    },
+                                    "required": ["label", "description"],
+                                },
+                            },
+                        },
+                        "required": ["question", "header", "options"],
+                    },
+                },
+            },
+            "required": ["questions"],
+        },
+    },
+    {
         "name": "fetch_document",
         "description": ("Fetch back the document as it was stored by the publishing "
                         "service, exactly as received."),
@@ -118,6 +153,16 @@ def main():
                 n = len(args.get("sections") or [])
                 reply(mid, {"content": [{"type": "text",
                                          "text": f"Stored. {n} sections received."}]})
+            elif name == "ask_decision":
+                log("ask_decision", args)
+                qs = args.get("questions") or []
+                # answer deterministically: always the first option of each question
+                picks = []
+                for q in qs:
+                    opts = (q.get("options") or []) if isinstance(q, dict) else []
+                    picks.append(opts[0].get("label", "") if opts else "")
+                reply(mid, {"content": [{"type": "text",
+                                         "text": "Operator chose: " + " | ".join(picks)}]})
             elif name == "fetch_document":
                 log("fetch_document", {})
                 doc = stored()
