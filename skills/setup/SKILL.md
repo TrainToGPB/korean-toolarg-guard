@@ -17,6 +17,11 @@ and every mutating step leaves a backup.
 All mechanics live in `scripts/setup.py` next to this file. Run the steps and show the user the
 real output; do not summarise a step as done without its output.
 
+Some of these commands get refused by the permission layer — they install a service, edit
+settings, and read a region of the environment that holds API keys. That is a boundary, not an
+obstacle to work around. Say which step was refused, hand the user the exact command, and carry
+on from its output.
+
 ## 1. Look before touching anything
 
 ```bash
@@ -31,6 +36,20 @@ already wired up, which port will be used, and whether a service manager is avai
 bare host like `https://api.anthropic.com`, `http://127.0.0.1:PORT/v1/claude-code` for a gateway
 with that path. The CLI appends `/v1/messages` on its own, so a `/v1` that is not in the upstream
 must not appear here.
+
+The endpoint can also live somewhere `wire` does not edit, so `detect` reports those too — read
+them rather than running your own `env | grep`, which is both redundant and likely to be refused
+for touching a region that holds API keys:
+
+- `shell_env_base_url` — a gateway exported from a shell profile. Once wired, `settings.json`
+  wins over it, so a mismatch between the two is worth saying out loud.
+- `other_base_url_sources` — managed policy files and `settings.local.json`. If one of them sets
+  a base URL it overrides what `wire` writes, and wiring will appear to do nothing at all.
+
+**`(unset — CLI default)` does not mean they go direct.** It means nothing was found in the
+places checked, which is also what a company gateway configured elsewhere looks like. Ask before
+treating `api.anthropic.com` as their endpoint — wiring the wrong upstream is the one mistake
+here that costs them API access.
 
 Then decide the mode:
 
@@ -56,12 +75,21 @@ Use the `upstream_to_use` value from `detect` as the real endpoint. If they are 
 gateway, that value is their gateway — check it looks right with them, because the proxy forwards
 there and a wrong value breaks every request.
 
-## 3. Install the service, then prove it works
+## 3. Check the upstream answers, install, then prove it works
 
 ```bash
+python3 "$SKILL_DIR/scripts/setup.py" probe-upstream --upstream <UPSTREAM>
 python3 "$SKILL_DIR/scripts/setup.py" install-service --port <PORT> --upstream <UPSTREAM>
 python3 "$SKILL_DIR/scripts/setup.py" dry-run --port <PORT>
 ```
+
+`probe-upstream` sends one unauthenticated POST to `<UPSTREAM>/v1/messages` and reads the status
+code, which separates the failure modes before anything is installed: `401`/`403` means the path
+and scheme are right and authentication is the CLI's business; `404` means the path is wrong;
+`405` means POST is refused at that scheme, which is what a plain-`http` listener in front of an
+https-only gateway looks like. It probes the other scheme too and prints both, so an `http://`
+that should be `https://` is one line of output rather than an afternoon. **Non-zero exit means
+do not install with that upstream.**
 
 `dry-run` sends one real request through the proxy using a throwaway settings copy, so it proves
 the path end to end while the user's live configuration is still untouched.
@@ -149,6 +177,12 @@ gui/$(id -u)/com.korean-toolarg-guard.proxy`) so nothing is left half-installed.
 
 Only restore a whole backup file if you have checked what else it would revert — the user may
 have changed `model` or other keys since it was written.
+
+And do not read an old backup as evidence of what their endpoint used to be. A file containing
+`KOREAN_GUARD_*` keys is this guard's own output from an earlier run; a `KOREAN_GUARD_UPSTREAM`
+of `https://api.anthropic.com` in one of them may be exactly the wrong guess that broke the
+machine. The user is the source of truth for their endpoint, and `probe-upstream` is how you
+confirm what they tell you.
 
 ## Notes
 

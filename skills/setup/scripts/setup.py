@@ -7,6 +7,8 @@ user real output instead of claiming success. Nothing here edits live configurat
 
   detect            report the current state as JSON: platform, config dir, current
                     endpoint, whether already wired, a free port, service manager
+  probe-upstream    POST unauthenticated to the upstream and report what answers, so a
+                    wrong scheme or path is caught before anything is installed
   render-service    write the launchd plist / systemd unit to a path and print it,
                     without installing anything
   install-service   install and start the supervised service, wait for the port
@@ -25,7 +27,9 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 
 LABEL = "com.korean-toolarg-guard.proxy"
 KEYS = ("ANTHROPIC_BASE_URL", "KOREAN_GUARD_UPSTREAM", "KOREAN_GUARD_PORT",
@@ -107,13 +111,42 @@ def resolve_upstream(env, fallback=DEFAULT_UPSTREAM):
     then the public default) when there is nothing to preserve — getting this wrong would
     silently redirect a company gateway to api.anthropic.com and lose the original on
     uninstall.
+
+    settings.json is checked first because its `env` block overrides the shell, but the
+    shell is checked too: a gateway exported from a profile is invisible in settings.json,
+    and treating that as "unset" is how a working gateway gets replaced by the default.
     """
     if env.get("KOREAN_GUARD_UPSTREAM"):
         return env["KOREAN_GUARD_UPSTREAM"]
-    base = env.get("ANTHROPIC_BASE_URL", "")
-    if base and not is_local(base):
-        return base
+    for base in (env.get("ANTHROPIC_BASE_URL", ""),
+                 os.environ.get("ANTHROPIC_BASE_URL", "")):
+        if base and not is_local(base):
+            return base
     return fallback
+
+
+def other_base_url_sources():
+    """Files that can set ANTHROPIC_BASE_URL and win over the one `wire` edits.
+
+    A managed policy file silently overrides the user settings, so wiring appears to
+    succeed and changes nothing. Cheaper to report than to debug.
+    """
+    found = []
+    for p in ("/etc/claude-code/managed-settings.json",
+              "/Library/Application Support/ClaudeCode/managed-settings.json",
+              os.path.join(cfg_dir(), "managed-settings.json"),
+              os.path.join(cfg_dir(), "settings.local.json")):
+        try:
+            if not os.path.exists(p):
+                continue
+            with open(p, encoding="utf-8") as f:
+                v = (json.load(f).get("env") or {}).get("ANTHROPIC_BASE_URL")
+            found.append({"file": p, "sets_base_url": v or None})
+        except PermissionError:
+            found.append({"file": p, "sets_base_url": "(unreadable)"})
+        except Exception:
+            found.append({"file": p, "sets_base_url": "(unparseable)"})
+    return found
 
 
 def proxy_base_url(port, upstream):
@@ -150,6 +183,10 @@ def cmd_detect(a):
         "settings_exists": os.path.exists(settings_path()),
         "settings_has_env_base_url": bool(base),
         "current_base_url": base or "(unset — CLI default)",
+        # Only the base URL is reported. Never print ANTHROPIC_CUSTOM_HEADERS or any
+        # *_API_KEY: they live in the same env block and a dump would leak them.
+        "shell_env_base_url": os.environ.get("ANTHROPIC_BASE_URL") or "(unset)",
+        "other_base_url_sources": other_base_url_sources(),
         "already_wired": wired,
         "upstream_to_use": upstream,
         "base_url_to_write": proxy_base_url(use_port, upstream),
@@ -285,6 +322,59 @@ def cmd_install_service(a):
     return 1
 
 
+# ── probe upstream ───────────────────────────────────────────────────────────
+def probe_once(url, timeout=8):
+    """POST to <url>/v1/messages unauthenticated and report only the status line.
+
+    No credentials are sent or read: the status code alone separates the failure modes,
+    and an unauthenticated probe cannot leak a key it never had.
+    """
+    target = url.rstrip("/") + "/v1/messages"
+    req = urllib.request.Request(target, data=b"{}", method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.headers.get("Allow", ""), ""
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers.get("Allow", ""), ""
+    except Exception as e:
+        return None, "", f"{type(e).__name__}: {e}"
+
+
+VERDICT = {
+    401: ("GOOD", "reached the API layer; auth is the CLI's job, not the proxy's"),
+    403: ("GOOD", "reached the API layer; auth is the CLI's job, not the proxy's"),
+    400: ("GOOD", "endpoint accepted the request shape"),
+    200: ("GOOD", "endpoint answered"),
+    404: ("WRONG PATH", "the path segment is wrong — check the upstream's path"),
+    405: ("WRONG SCHEME?", "POST refused at this scheme; a plain-http listener in front "
+                           "of an https-only gateway answers exactly like this"),
+}
+
+
+def cmd_probe(a):
+    env = (load_settings().get("env") or {})
+    url = a.upstream if a.upstream != DEFAULT_UPSTREAM else resolve_upstream(env, a.upstream)
+    flipped = ("https://" + url[len("http://"):]) if url.startswith("http://") else \
+              ("http://" + url[len("https://"):]) if url.startswith("https://") else ""
+    print(f"  upstream: {url}")
+    ok = False
+    for u in [url] + ([flipped] if flipped else []):
+        code, allow, err = probe_once(u)
+        if code is None:
+            print(f"  {u:<52} unreachable — {err}")
+            continue
+        verdict, why = VERDICT.get(code, ("?", "unexpected status"))
+        print(f"  {u:<52} {code} {verdict}"
+              + (f"  allow={allow}" if allow else ""))
+        print(f"      {why}")
+        if u == url and verdict == "GOOD":
+            ok = True
+    if not ok:
+        print("  -> do NOT install with this upstream; fix it first")
+    return 0 if ok else 1
+
+
 # ── dry run ──────────────────────────────────────────────────────────────────
 def cmd_dry_run(a):
     """Prove the proxy works before touching live settings."""
@@ -410,8 +500,8 @@ def cmd_status(a):
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("detect", "render-service", "install-service", "dry-run", "wire",
-                 "uninstall", "status"):
+    for name in ("detect", "probe-upstream", "render-service", "install-service",
+                 "dry-run", "wire", "uninstall", "status"):
         p = sub.add_parser(name)
         p.add_argument("--root", default="")
         p.add_argument("--port", type=int, default=0)
@@ -422,7 +512,8 @@ def main():
     if a.cmd in ("render-service", "install-service", "dry-run", "wire") and not a.port:
         sys.exit("--port is required for this step")
     return {
-        "detect": cmd_detect, "render-service": cmd_render_service,
+        "detect": cmd_detect, "probe-upstream": cmd_probe,
+        "render-service": cmd_render_service,
         "install-service": cmd_install_service, "dry-run": cmd_dry_run,
         "wire": cmd_wire, "uninstall": cmd_uninstall, "status": cmd_status,
     }[a.cmd](a)
