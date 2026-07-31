@@ -23,8 +23,14 @@ real output; do not summarise a step as done without its output.
 python3 "$SKILL_DIR/scripts/setup.py" detect
 ```
 
-Read the JSON and tell the user, in a couple of lines: what endpoint they are on now, whether
-they are already wired up, which port will be used, and whether a service manager is available.
+Read the JSON and tell the user, in a couple of lines: what endpoint they are on now
+(`upstream_to_use`), the URL that would be written (`base_url_to_write`), whether they are
+already wired up, which port will be used, and whether a service manager is available.
+
+`base_url_to_write` mirrors the upstream's path and nothing else — `http://127.0.0.1:PORT` for a
+bare host like `https://api.anthropic.com`, `http://127.0.0.1:PORT/v1/claude-code` for a gateway
+with that path. The CLI appends `/v1/messages` on its own, so a `/v1` that is not in the upstream
+must not appear here.
 
 Then decide the mode:
 
@@ -64,6 +70,17 @@ the path end to end while the user's live configuration is still untouched.
 `~/.claude/.state/escape-guard/proxy.log`, and work out why — a wrong upstream and a port
 collision are the usual causes.
 
+Two specific temptations to refuse, both of which have bricked a machine:
+
+- **Do not wire a value you already know is wrong, planning to correct it afterwards.** The
+  moment `settings.json` points somewhere that does not answer, you lose the API access you
+  need to make the correction — the session dies between the two steps and leaves the user
+  with no working CLI. Fix the value first, re-run `dry-run`, wire once.
+- **Do not read a model error at face value here.** A base URL that 404s surfaces as
+  *"There's an issue with the selected model … Run /model to pick a different model."*
+  Nothing is wrong with the model, and `/model` cannot help. Check `base_url_to_write`
+  against the upstream's path before believing anything the error says.
+
 ## 4. Wire it up
 
 ```bash
@@ -101,6 +118,37 @@ python3 "$SKILL_DIR/scripts/setup.py" uninstall
 
 `uninstall` stops and removes the service, restores the original endpoint, and removes the guard's
 env keys — with a backup. Offer it whenever the user reports that requests started failing.
+
+## When the CLI is already broken
+
+The symptom is every prompt in every session answering *"There's an issue with the selected
+model … Run /model to pick a different model."* If that started after wiring, the model is not
+the problem: the base URL is, and `/model` will not fix it.
+
+`uninstall` is the fix and needs no API access, so it still works from a dead session. Failing
+that — a truncated `settings.json`, an interrupted run — the edit is small enough to do by hand,
+and every `wire` left a `settings.json.ktg-backup-*` beside it:
+
+```bash
+python3 - <<'EOF'
+import json
+p = __import__("os").path.expanduser("~/.claude/settings.json")
+d = json.load(open(p)); env = d.get("env", {})
+for k in ("ANTHROPIC_BASE_URL", "KOREAN_GUARD_UPSTREAM", "KOREAN_GUARD_PORT",
+          "KOREAN_GUARD_BASE_WAS_UNSET"):
+    env.pop(k, None)
+d["env"] = env
+json.dump(d, open(p, "w"), ensure_ascii=False, indent=2)
+EOF
+```
+
+That returns the machine to the CLI's default endpoint. Confirm with
+`claude -p 'reply with exactly: ok'` before doing anything else, then stop the service
+(`systemctl --user disable --now korean-toolarg-guard.service`, or `launchctl bootout
+gui/$(id -u)/com.korean-toolarg-guard.proxy`) so nothing is left half-installed.
+
+Only restore a whole backup file if you have checked what else it would revert — the user may
+have changed `model` or other keys since it was written.
 
 ## Notes
 

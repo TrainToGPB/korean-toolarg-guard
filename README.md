@@ -168,12 +168,6 @@ race against the first API request.
 was refused twice, the model read the reason and re-emitted, and the third call passed at the
 cap — flag written, hook fired, tool never executed.
 
-**How often real traffic escapes is largely unmeasured.** In `claude-opus-5`, 11,450 Hangul
-across `Write` and a nested MCP argument came through with **zero** escapes, primed and
-unprimed alike. On that model the guard may rarely fire. Corruption *has* been hand-verified
-in older transcripts under `claude-opus-4-8` and `claude-opus-5`, so the behaviour is
-presumably intermittent or model-dependent; the proxy is what makes that measurable at all.
-
 **It cannot tell a right escape from a wrong one.** `미` and `밌` are both perfectly
 well-formed; nothing on the wire says which one was meant. Catching *that* needs Korean
 lexical knowledge, which is why the session note asks for a read rather than a diff.

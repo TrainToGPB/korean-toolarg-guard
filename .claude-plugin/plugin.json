@@ -1,7 +1,7 @@
 {
   "name": "korean-toolarg-guard",
   "displayName": "Korean Tool-Arg Guard",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Claude Code sometimes spells Korean in tool-call arguments as \\uXXXX escapes, which inflates tokens and turns one wrong hex digit into a different-but-valid Hangul syllable. A wire-level proxy detects the escapes and a PreToolUse hook refuses the call before it runs.",
   "author": {
     "name": "TrainToGPB"

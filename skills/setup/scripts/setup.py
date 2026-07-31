@@ -25,11 +25,15 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 
 LABEL = "com.korean-toolarg-guard.proxy"
 KEYS = ("ANTHROPIC_BASE_URL", "KOREAN_GUARD_UPSTREAM", "KOREAN_GUARD_PORT",
         "KOREAN_GUARD_FLAG_DIR", "KOREAN_GUARD_BASE_WAS_UNSET")
-DEFAULT_UPSTREAM = "https://api.anthropic.com/v1"
+# No "/v1": the CLI appends "/v1/messages" to whatever ANTHROPIC_BASE_URL says, so an
+# upstream carrying "/v1" produces "/v1/v1/messages" — a 404 the CLI then reports as
+# "issue with the selected model", which is a long way from the truth.
+DEFAULT_UPSTREAM = "https://api.anthropic.com"
 
 
 def cfg_dir():
@@ -91,20 +95,54 @@ def service_manager():
     return "none"
 
 
+# ── endpoint arithmetic ──────────────────────────────────────────────────────
+def is_local(url):
+    return url.startswith("http://127.0.0.1") or url.startswith("http://localhost")
+
+
+def resolve_upstream(env, fallback=DEFAULT_UPSTREAM):
+    """The endpoint the proxy must forward to.
+
+    The endpoint they are on right now IS the upstream. Only fall back to the flag (and
+    then the public default) when there is nothing to preserve — getting this wrong would
+    silently redirect a company gateway to api.anthropic.com and lose the original on
+    uninstall.
+    """
+    if env.get("KOREAN_GUARD_UPSTREAM"):
+        return env["KOREAN_GUARD_UPSTREAM"]
+    base = env.get("ANTHROPIC_BASE_URL", "")
+    if base and not is_local(base):
+        return base
+    return fallback
+
+
+def proxy_base_url(port, upstream):
+    """Where ANTHROPIC_BASE_URL must point for a proxy fronting `upstream`.
+
+    The proxy mounts itself at the upstream's path and strips that prefix before
+    forwarding (see tee_proxy.py), so the mount has to be *exactly* the upstream's path —
+    "/v1/claude-code" for a gateway, and empty for a bare host. Inventing a "/v1" when the
+    upstream has no path bricks the machine: every request 404s and the CLI blames the
+    model, so the settings.json that caused it is the last place anyone looks.
+    """
+    mount = urllib.parse.urlsplit(upstream).path.rstrip("/")
+    return f"http://127.0.0.1:{port}{mount}"
+
+
 # ── detect ───────────────────────────────────────────────────────────────────
 def cmd_detect(a):
     s = load_settings()
     env = s.get("env") or {}
     base = env.get("ANTHROPIC_BASE_URL", "")
-    wired = base.startswith("http://127.0.0.1") or base.startswith("http://localhost")
-    upstream = env.get("KOREAN_GUARD_UPSTREAM") or (
-        "" if wired else base) or DEFAULT_UPSTREAM
+    wired = is_local(base)
+    upstream = resolve_upstream(env, a.upstream)
     port = None
     if wired:
         try:
             port = int(base.split("//", 1)[1].split("/", 1)[0].rsplit(":", 1)[1])
         except Exception:
             port = None
+    use_port = port or free_port()
     root = plugin_root(a.root)
     info = {
         "platform": platform.system(),
@@ -114,7 +152,8 @@ def cmd_detect(a):
         "current_base_url": base or "(unset — CLI default)",
         "already_wired": wired,
         "upstream_to_use": upstream,
-        "port": port or free_port(),
+        "base_url_to_write": proxy_base_url(use_port, upstream),
+        "port": use_port,
         "port_in_use": listening(port or 0) if port else False,
         "service_manager": service_manager(),
         "plugin_root": root,
@@ -159,13 +198,18 @@ def plist_text(py, proxy, port, upstream, flag_dir, log):
 """
 
 
-def unit_text(py, proxy, port, upstream, flag_dir):
+def unit_text(py, proxy, port, upstream, flag_dir, log):
+    # Without the append: lines the proxy's output goes to journald only, proxy.log is
+    # never created, and `status` shows an empty log on the platform where you most need
+    # it. Needs systemd 240+; older systemd ignores the directive rather than failing.
     return f"""[Unit]
 Description=korean-toolarg-guard escape-detection proxy
 After=network-online.target
 
 [Service]
 ExecStart={py} -u {proxy} --upstream {upstream} --port {port} --flag-dir {flag_dir}
+StandardOutput=append:{log}
+StandardError=append:{log}
 Restart=always
 RestartSec=2
 
@@ -192,7 +236,7 @@ def build_service(a):
     py = sys.executable
     if platform.system() == "Darwin":
         return plist_text(py, proxy, a.port, a.upstream, flag_dir, log)
-    return unit_text(py, proxy, a.port, a.upstream, flag_dir)
+    return unit_text(py, proxy, a.port, a.upstream, flag_dir, log)
 
 
 def cmd_render_service(a):
@@ -249,10 +293,12 @@ def cmd_dry_run(a):
         return 1
     s = load_settings()
     env = dict(s.get("env") or {})
-    base = env.get("ANTHROPIC_BASE_URL", DEFAULT_UPSTREAM)
-    suffix = base.split("//", 1)[1].split("/", 1)[1] if "//" in base and "/" in \
-        base.split("//", 1)[1] else "v1"
-    env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{a.port}/{suffix}"
+    # Must be the exact URL `wire` will write. If the two are computed differently the
+    # gate proves nothing about the thing it is gating.
+    up = resolve_upstream(env, a.upstream)
+    env["ANTHROPIC_BASE_URL"] = proxy_base_url(a.port, up)
+    print(f"  upstream: {up}")
+    print(f"  base URL: {env['ANTHROPIC_BASE_URL']}")
     tmp = os.path.join(state_dir(), "dryrun-settings.json")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"env": env, "model": s.get("model", "opus")}, f)
@@ -279,37 +325,21 @@ def cmd_dry_run(a):
 
 
 # ── wire / uninstall / status ───────────────────────────────────────────────
-def is_local(url):
-    return url.startswith("http://127.0.0.1") or url.startswith("http://localhost")
-
-
 def cmd_wire(a):
     p = settings_path()
     s = load_settings()
     env = dict(s.get("env") or {})
     base = env.get("ANTHROPIC_BASE_URL", "")
-    # The endpoint they are on right now IS the upstream. Only fall back to the flag (and
-    # then the public default) when there is nothing to preserve — getting this wrong would
-    # silently redirect a company gateway to api.anthropic.com and lose the original on
-    # uninstall.
-    if env.get("KOREAN_GUARD_UPSTREAM"):
-        real = env["KOREAN_GUARD_UPSTREAM"]
-    elif base and not is_local(base):
-        real = base
-    else:
-        real = a.upstream
+    real = resolve_upstream(env, a.upstream)
     if not base:
         env["KOREAN_GUARD_BASE_WAS_UNSET"] = "1"   # so uninstall removes it, not guesses
-    ref = base or real
-    suffix = ref.split("//", 1)[1].split("/", 1)[1] if "//" in ref and "/" in \
-        ref.split("//", 1)[1] else "v1"
     if os.path.exists(p):
         bak = p + f".ktg-backup-{time.strftime('%Y%m%d-%H%M%S')}"
         shutil.copy2(p, bak)
         os.chmod(bak, 0o600)
         print(f"  backup: {bak}")
     env["KOREAN_GUARD_UPSTREAM"] = real
-    env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{a.port}/{suffix}"
+    env["ANTHROPIC_BASE_URL"] = proxy_base_url(a.port, real)
     env["KOREAN_GUARD_PORT"] = str(a.port)
     s["env"] = env
     with open(p, "w", encoding="utf-8") as f:
